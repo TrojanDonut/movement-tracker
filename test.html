@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>M5Stick Motion Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f0f0f0;
+        }
+        .data-display {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-top: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        .value {
+            font-size: 24px;
+            font-weight: bold;
+        }
+        .status {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .connected {
+            background: #d4edda;
+            color: #155724;
+        }
+        .disconnected {
+            background: #f8d7da;
+            color: #721c24;
+        }
+    </style>
+</head>
+<body>
+    <h1>M5Stick Motion Test</h1>
+    <button id="connectButton">Connect to M5Stick</button>
+    
+    <div id="statusDiv" class="status disconnected">
+        Status: Disconnected
+    </div>
+
+    <div class="data-display">
+        <h2>Motion Data:</h2>
+        <div>
+            X: <span id="xValue" class="value">0</span>°
+        </div>
+        <div>
+            Y: <span id="yValue" class="value">0</span>°
+        </div>
+        <div>
+            Z: <span id="zValue" class="value">0</span>°
+        </div>
+    </div>
+
+    <script>
+        const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+        const CHARACTERISTIC_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+        
+        let device = null;
+        
+        async function connectToDevice() {
+            try {
+                device = await navigator.bluetooth.requestDevice({
+                    filters: [{ name: 'M5Motion' }],
+                    optionalServices: [SERVICE_UUID]
+                });
+
+                const server = await device.gatt.connect();
+                const service = await server.getPrimaryService(SERVICE_UUID);
+                const characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+
+                // Start notifications
+                await characteristic.startNotifications();
+                characteristic.addEventListener('characteristicvaluechanged', handleMotionData);
+
+                document.getElementById('statusDiv').className = 'status connected';
+                document.getElementById('statusDiv').textContent = 'Status: Connected';
+                document.getElementById('connectButton').textContent = 'Disconnect';
+
+                device.addEventListener('gattserverdisconnected', onDisconnected);
+            } catch (error) {
+                console.error(error);
+                alert('Error connecting to device: ' + error);
+            }
+        }
+
+        function handleMotionData(event) {
+            const value = new TextDecoder().decode(event.target.value);
+            try {
+                const data = JSON.parse(value);
+                document.getElementById('xValue').textContent = data.x.toFixed(2);
+                document.getElementById('yValue').textContent = data.y.toFixed(2);
+                document.getElementById('zValue').textContent = data.z.toFixed(2);
+            } catch (e) {
+                console.error('Error parsing data:', e);
+            }
+        }
+
+        function onDisconnected() {
+            document.getElementById('statusDiv').className = 'status disconnected';
+            document.getElementById('statusDiv').textContent = 'Status: Disconnected';
+            document.getElementById('connectButton').textContent = 'Connect to M5Stick';
+        }
+
+        document.getElementById('connectButton').addEventListener('click', async () => {
+            if (device && device.gatt.connected) {
+                await device.gatt.disconnect();
+            } else {
+                await connectToDevice();
+            }
+        });
+    </script>
+</body>
+</html>
