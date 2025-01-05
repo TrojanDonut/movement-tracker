@@ -1,6 +1,48 @@
-import React from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, ReferenceArea } from 'recharts';
-import { useState, useEffect } from 'react';
+
+// Web Bluetooth API types
+interface BluetoothRemoteGATTCharacteristic {
+  startNotifications(): Promise<BluetoothRemoteGATTCharacteristic>;
+  stopNotifications(): Promise<BluetoothRemoteGATTCharacteristic>;
+  writeValue(value: BufferSource): Promise<void>;
+  readValue(): Promise<DataView>;
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject): void;
+  removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void;
+  value?: DataView;
+}
+
+interface BluetoothRemoteGATTService {
+  getCharacteristic(characteristic: string): Promise<BluetoothRemoteGATTCharacteristic>;
+}
+
+interface BluetoothRemoteGATTServer {
+  connect(): Promise<BluetoothRemoteGATTServer>;
+  connected: boolean;
+  disconnect(): void;
+  getPrimaryService(service: string): Promise<BluetoothRemoteGATTService>;
+}
+
+interface BluetoothDevice {
+  gatt?: BluetoothRemoteGATTServer;
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject): void;
+  removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void;
+}
+
+declare global {
+  interface Navigator {
+    bluetooth: {
+      requestDevice(options: {
+        filters: Array<{ name?: string; services?: string[] }>;
+        optionalServices?: string[];
+      }): Promise<BluetoothDevice>;
+    };
+  }
+
+  interface Window {
+    AudioContext: typeof AudioContext;
+  }
+}
 
 interface Measurement {
   x: number;
@@ -23,7 +65,8 @@ interface Calibration {
 }
 
 const MovementTracker: React.FC = () => {
-  const [mode, setMode] = useState<'idle' | 'calibrating' | 'tracking'>('idle');
+  const [mode, setMode] = useState<'idle' | 'connecting' | 'calibrating' | 'tracking'>('idle');
+  const [device, setDevice] = useState<BluetoothDevice | null>(null);
   const [calibration, setCalibration] = useState<Calibration>({ x: 0, y: 0, z: 0 });
   const [calibrationSamples, setCalibrationSamples] = useState<Measurement[]>([]);
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
@@ -32,132 +75,275 @@ const MovementTracker: React.FC = () => {
   const [currentZ, setCurrentZ] = useState<number>(0);
   const [finalStats, setFinalStats] = useState<Stats | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [calibrationProgress, setCalibrationProgress] = useState<number>(0);
   const [startTime, setStartTime] = useState<number>(0);
+  const [calibrationProgress, setCalibrationProgress] = useState<number>(0);
+  const [lastRawData, setLastRawData] = useState<string>('No data received');
+  const [lastParsedData, setLastParsedData] = useState<{x: number, y: number, z: number} | null>(null);
+  const [debugMessages, setDebugMessages] = useState<string[]>([]);
 
-  const CALIBRATION_DURATION = 3; // seconds
-  const SAMPLES_PER_SECOND = 60;
-  const TOTAL_CALIBRATION_SAMPLES = CALIBRATION_DURATION * SAMPLES_PER_SECOND;
-  const PERFECT_ZONE_RANGE = 2; // ±2 degrees is considered "perfect"
+  const PERFECT_ZONE_RANGE = 2;
+  const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+  const CHARACTERISTIC_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+  const REQUIRED_CALIBRATION_SAMPLES = 10;
 
+  // Use refs to break circular dependencies
+  const characteristicRef = useRef<BluetoothRemoteGATTCharacteristic | null>(null);
+
+  const addDebugMessage = useCallback((message: string) => {
+    setDebugMessages(prev => {
+      const newMessages = [...prev, `${new Date().toISOString().split('T')[1].split('.')[0]} - ${message}`];
+      return newMessages.slice(-5);
+    });
+  }, []);
+
+  const playBeep = useCallback((frequency: number) => {
+    try {
+      const AudioContext = window.AudioContext;
+      const audioContext = new AudioContext();
+      const oscillator = audioContext.createOscillator();
+      oscillator.connect(audioContext.destination);
+      oscillator.frequency.setValueAtTime(frequency, audioContext.currentTime);
+      oscillator.start();
+      oscillator.stop(audioContext.currentTime + 0.1);
+    } catch (error) {
+      addDebugMessage(`Audio error: ${error}`);
+    }
+  }, [addDebugMessage]);
+
+  const calculateFinalStats = useCallback(() => {
+    if (measurements.length === 0) return;
+
+    let maxDeviation = 0;
+    let totalDeviation = 0;
+
+    measurements.forEach(measurement => {
+      const horizontalDeviation = Math.sqrt(
+        Math.pow(measurement.x, 2) + 
+        Math.pow(measurement.z, 2)
+      );
+      maxDeviation = Math.max(maxDeviation, horizontalDeviation);
+      totalDeviation += horizontalDeviation;
+    });
+
+    const stats = {
+      maxDeviation: maxDeviation.toFixed(2),
+      avgDeviation: (totalDeviation / measurements.length).toFixed(2),
+      duration: ((Date.now() - startTime) / 1000).toFixed(2),
+      samples: measurements.length
+    };
+    
+    setFinalStats(stats);
+    addDebugMessage(`Stats calculated: max=${stats.maxDeviation}°, avg=${stats.avgDeviation}°`);
+  }, [measurements, startTime, addDebugMessage]);
+
+  const handleDisconnect = useCallback(() => {
+    addDebugMessage('Device disconnected');
+    if (measurements.length > 0) {
+      calculateFinalStats();
+    }
+    setMode('idle');
+    setError('Device disconnected');
+  }, [measurements.length, addDebugMessage, calculateFinalStats]);
+
+  const handleCalibrationData = useCallback((data: {x: number, y: number, z: number}) => {
+    const timestamp = Date.now();
+    setCalibrationSamples(prev => {
+      const newSamples = [...prev, { x: data.x, y: data.y, z: data.z, timestamp }];
+      const progress = (newSamples.length / REQUIRED_CALIBRATION_SAMPLES) * 100;
+      setCalibrationProgress(Math.min(progress, 100));
+      addDebugMessage(`Calibration sample ${newSamples.length}/${REQUIRED_CALIBRATION_SAMPLES}`);
+
+      if (newSamples.length >= REQUIRED_CALIBRATION_SAMPLES) {
+        const avgX = newSamples.reduce((sum, sample) => sum + sample.x, 0) / newSamples.length;
+        const avgY = newSamples.reduce((sum, sample) => sum + sample.y, 0) / newSamples.length;
+        const avgZ = newSamples.reduce((sum, sample) => sum + sample.z, 0) / newSamples.length;
+        
+        setCalibration({ x: avgX, y: avgY, z: avgZ });
+        setMode('tracking');
+        setStartTime(Date.now());
+        setMeasurements([]);
+        addDebugMessage('Calibration complete! Starting tracking...');
+      }
+      return newSamples;
+    });
+  }, [REQUIRED_CALIBRATION_SAMPLES, addDebugMessage]);
+
+  // Add a modeRef to avoid closure issues
+  const modeRef = useRef<'idle' | 'connecting' | 'calibrating' | 'tracking'>('idle');
+
+  // Update modeRef whenever mode changes
   useEffect(() => {
-    if (typeof window !== 'undefined' && !window.DeviceMotionEvent) {
-      setError("Device motion not supported on this device");
+    modeRef.current = mode;
+  }, [mode]);
+
+  const handleMotionData = useCallback((event: Event) => {
+    const characteristic = event.target as unknown as BluetoothRemoteGATTCharacteristic;
+    const dataView = characteristic.value;
+    if (!dataView) {
+      addDebugMessage('Received empty dataView');
       return;
     }
-
-    // Initialize measurements array at the start of tracking
-    if (mode === 'tracking') {
-      setMeasurements([]);
-    }
-
-    const handleMotion = (event: DeviceMotionEvent) => {
-      if (mode === 'idle') return;
-
-      const { x, y, z } = event.accelerationIncludingGravity || {};
-      const rawX = x || 0;
-      const rawY = y || 0;
-      const rawZ = z || 0;
-
-      if (mode === 'calibrating') {
+    
+    const decoder = new TextDecoder();
+    const rawValue = decoder.decode(dataView);
+    setLastRawData(rawValue);
+    
+    try {
+      const data = JSON.parse(rawValue);
+      setLastParsedData(data);
+      
+      // Debug the current mode and data
+      addDebugMessage(`Mode: ${modeRef.current}, Data: x=${data.x.toFixed(2)}, y=${data.y.toFixed(2)}, z=${data.z.toFixed(2)}`);
+      
+      // Explicitly check the current mode using ref
+      if (modeRef.current === 'calibrating') {
+        const timestamp = Date.now();
         setCalibrationSamples(prev => {
-          const newSamples = [...prev, { x: rawX, y: rawY, z: rawZ, timestamp: Date.now() }];
-          setCalibrationProgress((newSamples.length / TOTAL_CALIBRATION_SAMPLES) * 100);
+          const newSamples = [...prev, { x: data.x, y: data.y, z: data.z, timestamp }];
+          const progress = (newSamples.length / REQUIRED_CALIBRATION_SAMPLES) * 100;
           
-          if (newSamples.length >= TOTAL_CALIBRATION_SAMPLES) {
+          // Debug calibration progress
+          addDebugMessage(`Calibration progress: ${newSamples.length}/${REQUIRED_CALIBRATION_SAMPLES}`);
+          setCalibrationProgress(Math.min(progress, 100));
+          
+          if (newSamples.length >= REQUIRED_CALIBRATION_SAMPLES) {
             const avgX = newSamples.reduce((sum, sample) => sum + sample.x, 0) / newSamples.length;
             const avgY = newSamples.reduce((sum, sample) => sum + sample.y, 0) / newSamples.length;
             const avgZ = newSamples.reduce((sum, sample) => sum + sample.z, 0) / newSamples.length;
             
+            addDebugMessage('Calibration complete, setting averages');
             setCalibration({ x: avgX, y: avgY, z: avgZ });
             setMode('tracking');
-            const currentTime = Date.now();
-            setStartTime(currentTime);
+            setStartTime(Date.now());
+            setMeasurements([]);
             return [];
           }
           return newSamples;
         });
-      } else if (mode === 'tracking') {
-        const calibratedX = rawX - calibration.x;
-        const calibratedY = rawY - calibration.y;
-        const calibratedZ = rawZ - calibration.z;
+      } else if (modeRef.current === 'tracking') {
+        const calibratedX = data.x - calibration.x;
+        const calibratedY = data.y - calibration.y;
+        const calibratedZ = data.z - calibration.z;
         
         setCurrentX(calibratedX);
         setCurrentY(calibratedY);
         setCurrentZ(calibratedZ);
 
-        const currentTimestamp = Date.now() - startTime;
-        const newMeasurement = {
+        const timestamp = Date.now() - startTime;
+        setMeasurements(prev => [...prev, {
           x: calibratedX,
           y: calibratedY,
           z: calibratedZ,
-          timestamp: currentTimestamp
-        };
-        
-        setMeasurements(prev => [...prev, newMeasurement]);
+          timestamp
+        }]);
       }
-    };
-
-    if (mode !== 'idle') {
-      window.addEventListener('devicemotion', handleMotion);
+    } catch (error) {
+      const errorMessage = `Error parsing data: ${error instanceof Error ? error.message : String(error)}`;
+      addDebugMessage(errorMessage);
+      setError(errorMessage);
     }
+  }, [calibration, startTime, REQUIRED_CALIBRATION_SAMPLES, addDebugMessage]);
 
-    return () => {
-      window.removeEventListener('devicemotion', handleMotion);
-    };
-  }, [mode, calibration, startTime]);
+  const connectBLE = useCallback(async () => {
+    try {
+      setMode('connecting');
+      setError(null);
+      setCalibrationSamples([]); // Clear any existing samples
+      setCalibrationProgress(0);
+      addDebugMessage('Starting BLE connection...');
 
-  const playBeep = (frequency: number) => {
-    const AudioContext = window.AudioContext || window.AudioContext;
-    const audioContext = new AudioContext();
-    const oscillator = audioContext.createOscillator();
-    oscillator.connect(audioContext.destination);
-    oscillator.frequency.setValueAtTime(frequency, audioContext.currentTime);
-    oscillator.start();
-    oscillator.stop(audioContext.currentTime + 0.1);
-  };
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ name: 'M5Motion' }],
+        optionalServices: [SERVICE_UUID]
+      });
 
-  const startCalibration = () => {
-    setCalibrationSamples([]);
-    setCalibrationProgress(0);
-    setMeasurements([]);
-    setStartTime(0);
-    setMode('calibrating');
-    playBeep(440);
-  };
+      addDebugMessage('Device selected, connecting to GATT server...');
+      const server = await device.gatt?.connect();
+      if (!server) throw new Error('Failed to connect to GATT server');
 
-  const stopTracking = () => {
+      addDebugMessage('Connected to GATT server, getting service...');
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      const characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+      characteristicRef.current = characteristic;
+
+      addDebugMessage('Starting notifications...');
+      await characteristic.startNotifications();
+      characteristic.addEventListener('characteristicvaluechanged', handleMotionData);
+
+      setDevice(device);
+      device.addEventListener('gattserverdisconnected', handleDisconnect);
+      
+      // Set mode to calibrating after everything is set up
+      setMode('calibrating');
+      addDebugMessage('Starting calibration phase');
+      playBeep(440);
+
+    } catch (error) {
+      const errorMessage = `Connection failed: ${error instanceof Error ? error.message : String(error)}`;
+      setError(errorMessage);
+      addDebugMessage(errorMessage);
+      setMode('idle');
+    }
+  }, [SERVICE_UUID, CHARACTERISTIC_UUID, handleMotionData, handleDisconnect, addDebugMessage, playBeep]);
+
+  const stopTracking = useCallback(async () => {
+    addDebugMessage('Stopping tracking...');
+    if (device?.gatt?.connected) {
+      await device.gatt.disconnect();
+    }
+    
+    if (measurements.length > 0) {
+      calculateFinalStats();
+    }
+    
     setMode('idle');
     playBeep(880);
+  }, [device, measurements.length, calculateFinalStats, addDebugMessage, playBeep]);
 
-    if (measurements.length > 0) {
-      const calculateStats = (): Stats => {
-        let maxDeviation = 0;
-        let totalDeviation = 0;
+  const DebugPanel = () => (
+    <div className="mt-4 p-4 bg-slate-800 rounded-lg border border-slate-700">
+      <h3 className="text-white font-bold text-lg mb-2">Debug Information</h3>
+      
+      <div className="space-y-2">
+        <div className="bg-slate-700 p-2 rounded">
+          <div className="text-emerald-400 text-sm font-bold">Current Mode:</div>
+          <div className="text-white text-sm">{mode}</div>
+        </div>
+
+        <div className="bg-slate-700 p-2 rounded">
+          <div className="text-emerald-400 text-sm font-bold">Last Raw Data:</div>
+          <div className="text-white text-sm break-all">{lastRawData}</div>
+        </div>
         
-        for (let i = 0; i < measurements.length; i++) {
-          const horizontalDeviation = Math.sqrt(
-            Math.pow(measurements[i].x, 2) + 
-            Math.pow(measurements[i].z, 2)
-          );
-          maxDeviation = Math.max(maxDeviation, horizontalDeviation);
-          totalDeviation += horizontalDeviation;
-        }
-
-        const avgDeviation = totalDeviation / measurements.length;
-        const duration = (Date.now() - startTime) / 1000;
-
-        return {
-          maxDeviation: maxDeviation.toFixed(2),
-          avgDeviation: avgDeviation.toFixed(2),
-          duration: duration.toFixed(2),
-          samples: measurements.length
-        };
-      };
-
-      setFinalStats(calculateStats());
-    }
-  };
+        {lastParsedData && (
+          <div className="bg-slate-700 p-2 rounded">
+            <div className="text-emerald-400 text-sm font-bold">Last Parsed Data:</div>
+            <div className="text-white text-sm">
+              x: {lastParsedData.x.toFixed(2)}, 
+              y: {lastParsedData.y.toFixed(2)}, 
+              z: {lastParsedData.z.toFixed(2)}
+            </div>
+          </div>
+        )}
+        
+        <div className="bg-slate-700 p-2 rounded">
+          <div className="text-emerald-400 text-sm font-bold">Debug Log:</div>
+          {debugMessages.map((msg, i) => (
+            <div key={i} className="text-white text-sm">{msg}</div>
+          ))}
+        </div>
+        
+        {mode === 'calibrating' && (
+          <div className="bg-slate-700 p-2 rounded">
+            <div className="text-emerald-400 text-sm font-bold">Calibration Status:</div>
+            <div className="text-white text-sm">
+              Samples: {calibrationSamples.length}/{REQUIRED_CALIBRATION_SAMPLES}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 
   const DeviationChart = ({ data, dataKey, title, color }: { 
     data: Measurement[], 
@@ -250,7 +436,13 @@ const MovementTracker: React.FC = () => {
   return (
     <div className="w-full max-w-4xl mx-auto p-6 bg-slate-900 rounded-lg shadow-xl">
       <div className="mb-6">
-        <h2 className="text-2xl font-bold mb-2 text-white">Movement Tracker</h2>
+        <h2 className="text-2xl font-bold mb-2 text-white">M5Stick Movement Tracker</h2>
+        {mode === 'connecting' && (
+          <div className="bg-blue-500 text-white px-4 py-2 rounded-lg mb-4">
+            <div className="text-lg font-bold mb-2">Connecting...</div>
+            <div className="text-sm">Looking for M5Stick device</div>
+          </div>
+        )}
         {mode === 'calibrating' && (
           <div className="bg-blue-500 text-white px-4 py-2 rounded-lg mb-4">
             <div className="text-lg font-bold mb-2">Calibrating...</div>
@@ -260,7 +452,7 @@ const MovementTracker: React.FC = () => {
                 style={{ width: `${calibrationProgress}%` }}
               ></div>
             </div>
-            <div className="text-sm mt-1">Hold phone still against bar</div>
+            <div className="text-sm mt-1">Hold device still</div>
           </div>
         )}
         {mode === 'tracking' && (
@@ -270,20 +462,29 @@ const MovementTracker: React.FC = () => {
         )}
       </div>
 
+      {/* Debug Panel - Always visible */}
+      <DebugPanel />
+
+      {error && (
+        <div className="bg-red-500/10 border border-red-500 text-red-500 px-4 py-2 rounded-lg mb-4">
+          {error}
+        </div>
+      )}
+
       <div className="space-y-4">
         {mode === 'idle' && (
           <button
-            onClick={startCalibration}
-            className="w-full p-4 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-bold text-lg"
+            onClick={connectBLE}
+            className="w-full p-4 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-bold text-lg transition-colors"
           >
-            Start Calibration
+            Connect M5Stick
           </button>
         )}
         
         {mode === 'tracking' && (
           <button
             onClick={stopTracking}
-            className="w-full p-4 bg-red-500 hover:bg-red-600 text-white rounded-lg font-bold text-lg"
+            className="w-full p-4 bg-red-500 hover:bg-red-600 text-white rounded-lg font-bold text-lg transition-colors"
           >
             Stop Tracking
           </button>
@@ -343,10 +544,6 @@ const MovementTracker: React.FC = () => {
             />
           </div>
         </div>
-      )}
-
-      {error && (
-        <div className="text-red-400 mb-4 font-semibold">{error}</div>
       )}
     </div>
   );

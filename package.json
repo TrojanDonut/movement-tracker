@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@/components/ui": "^1.0.0",  
     "@capacitor/android": "^6.2.0",
     "@capacitor/cli": "^6.2.0",
     "@capacitor/core": "^6.2.0",
