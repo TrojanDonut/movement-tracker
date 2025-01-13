@@ -90,6 +90,8 @@ const MovementTracker: React.FC = () => {
     maxDepth: 0
   });
 
+  const [showDebug, setShowDebug] = useState<boolean>(false);
+
   const PERFECT_ZONE_RANGE = 2;
   const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
   const CHARACTERISTIC_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
@@ -527,8 +529,13 @@ const MovementTracker: React.FC = () => {
         )}
       </div>
 
-      {/* Debug Panel - Always visible */}
-      <DebugPanel />
+      <button 
+        onClick={() => setShowDebug(prev => !prev)}
+        className="mt-4 px-3 py-1 text-sm bg-slate-700 hover:bg-slate-600 text-white rounded"
+      >
+        {showDebug ? 'Hide Debug Info' : 'Show Debug Info'}
+      </button>
+      {showDebug && <DebugPanel />}
 
       {error && (
         <div className="bg-red-500/10 border border-red-500 text-red-500 px-4 py-2 rounded-lg mb-4">
