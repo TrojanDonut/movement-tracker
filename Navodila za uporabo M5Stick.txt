@@ -1,0 +1,49 @@
+# Navodila za uporabo M5Stick Movement Tracker-ja
+
+## Potrebna oprema
+- M5Stick naprava
+- Računalnik/telefon s podporo za Bluetooth
+- Spletni brskalnik, ki podpira Web Bluetooth API (Chrome, Edge, Opera)
+
+## Priprava M5Stick naprave
+1. Vklopite M5Stick napravo
+2. Prepričajte se, da je baterija dovolj napolnjena
+
+## Postopek uporabe
+
+### 1. Povezovanje
+0. Zaženite "npm run dev" v korenski mapi aplikacije
+1. Odprite aplikacijo v brskalniku (https://<vaš-ip-računalnika>:3000)
+2. Kliknite na gumb "Connect M5Stick"
+3. V pojavnem oknu izberite vašo M5Stick napravo (imenovano "M5Motion")
+4. Počakajte na vzpostavitev povezave
+
+### 2. Kalibracija
+1. Ko je naprava povezana, se začne kalibracija
+2. Držite M5Stick popolnoma pri miru
+3. Počakajte, da se modra vrstica napolni do konca (približno 10 vzorcev)
+4. Ko zaslišite pisk, je kalibracija končana
+
+### 3. Sledenje gibanju
+1. Po kalibraciji se začne sledenje (pojavi se zeleni napis "TRACKING ACTIVE")
+2. Izvedite počep
+3. Spremljajte podatke v živo:
+   - Side-to-side: premikanje levo-desno
+   - Up-down: premikanje gor-dol
+   - Forward-back: premikanje naprej-nazaj
+
+### 4. Zaključek
+1. Ko končate z gibanjem, pritisnite rdeči gumb "Stop Tracking"
+2. Prikazali se bodo končni rezultati:
+   - Najgloblji del počepa (Bottom of Squat)
+   - Maksimalna globina (Max Depth)
+   - Največje odstopanje (Max Deviation)
+   - Povprečno odstopanje (Avg Deviation)
+   - Število vzorcev (Samples)
+
+### 5. Dodatne možnosti
+- Za prikaz debugiranja kliknite gumb "Show Debug Info"
+- Grafi prikazujejo:
+  - Globino počepa (modra črta)
+  - Stransko gibanje (zelena črta)
+  - Popolna cona je označena z zelenim pasom (±2°)
