@@ -64,6 +64,11 @@ interface Calibration {
   z: number;
 }
 
+interface SquatPhases {
+  bottomPoint: number | null;
+  maxDepth: number;
+}
+
 const MovementTracker: React.FC = () => {
   const [mode, setMode] = useState<'idle' | 'connecting' | 'calibrating' | 'tracking'>('idle');
   const [device, setDevice] = useState<BluetoothDevice | null>(null);
@@ -80,6 +85,10 @@ const MovementTracker: React.FC = () => {
   const [lastRawData, setLastRawData] = useState<string>('No data received');
   const [lastParsedData, setLastParsedData] = useState<{x: number, y: number, z: number} | null>(null);
   const [debugMessages, setDebugMessages] = useState<string[]>([]);
+  const [squatPhases, setSquatPhases] = useState<SquatPhases>({
+    bottomPoint: null,
+    maxDepth: 0
+  });
 
   const PERFECT_ZONE_RANGE = 2;
   const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
@@ -94,6 +103,26 @@ const MovementTracker: React.FC = () => {
       const newMessages = [...prev, `${new Date().toISOString().split('T')[1].split('.')[0]} - ${message}`];
       return newMessages.slice(-5);
     });
+  }, []);
+
+  const detectSquatPhases = useCallback((data: Measurement[]) => {
+    if (data.length < 3) return null;
+    
+    let bottomPoint = null;
+    let maxDepth = 0;
+    
+    for (let i = 1; i < data.length - 1; i++) {
+      const prev = data[i - 1].z;
+      const curr = data[i].z;
+      const next = data[i + 1].z;
+      
+      if (curr < prev && curr < next && Math.abs(curr) > Math.abs(maxDepth)) {
+        maxDepth = curr;
+        bottomPoint = data[i].timestamp; // This is now already in seconds
+      }
+    }
+    
+    return { bottomPoint, maxDepth };
   }, []);
 
   const playBeep = useCallback((frequency: number) => {
@@ -112,10 +141,10 @@ const MovementTracker: React.FC = () => {
 
   const calculateFinalStats = useCallback(() => {
     if (measurements.length === 0) return;
-
+  
     let maxDeviation = 0;
     let totalDeviation = 0;
-
+  
     measurements.forEach(measurement => {
       const horizontalDeviation = Math.sqrt(
         Math.pow(measurement.x, 2) + 
@@ -124,31 +153,48 @@ const MovementTracker: React.FC = () => {
       maxDeviation = Math.max(maxDeviation, horizontalDeviation);
       totalDeviation += horizontalDeviation;
     });
-
+  
+    // Calculate duration from last measurement timestamp
+    const duration = measurements[measurements.length - 1].timestamp;
+  
     const stats = {
       maxDeviation: maxDeviation.toFixed(2),
       avgDeviation: (totalDeviation / measurements.length).toFixed(2),
-      duration: ((Date.now() - startTime) / 1000).toFixed(2),
+      duration: duration.toFixed(2),
       samples: measurements.length
     };
     
     setFinalStats(stats);
-    addDebugMessage(`Stats calculated: max=${stats.maxDeviation}°, avg=${stats.avgDeviation}°`);
-  }, [measurements, startTime, addDebugMessage]);
+    addDebugMessage(
+      `Session complete - ${duration.toFixed(1)}s, max=${stats.maxDeviation}°, avg=${stats.avgDeviation}°`
+    );
+  }, [measurements, addDebugMessage]);
 
   const handleDisconnect = useCallback(() => {
     addDebugMessage('Device disconnected');
     if (measurements.length > 0) {
       calculateFinalStats();
+      const phases = detectSquatPhases(measurements);
+      if (phases) {
+        setSquatPhases(phases);
+      }
     }
     setMode('idle');
     setError('Device disconnected');
-  }, [measurements.length, addDebugMessage, calculateFinalStats]);
+  }, [measurements.length, addDebugMessage, calculateFinalStats, detectSquatPhases]);
 
   const handleCalibrationData = useCallback((data: {x: number, y: number, z: number}) => {
-    const timestamp = Date.now();
+    const SAMPLE_PERIOD = 0.05;  // 50ms = 0.05s
+    const elapsedTimeSeconds = measurementCountRef.current * SAMPLE_PERIOD;
+    measurementCountRef.current++;
+
     setCalibrationSamples(prev => {
-      const newSamples = [...prev, { x: data.x, y: data.y, z: data.z, timestamp }];
+      const newSamples = [...prev, { 
+        x: data.x, 
+        y: data.y, 
+        z: data.z, 
+        timestamp: elapsedTimeSeconds 
+      }];
       const progress = (newSamples.length / REQUIRED_CALIBRATION_SAMPLES) * 100;
       setCalibrationProgress(Math.min(progress, 100));
       addDebugMessage(`Calibration sample ${newSamples.length}/${REQUIRED_CALIBRATION_SAMPLES}`);
@@ -160,13 +206,13 @@ const MovementTracker: React.FC = () => {
         
         setCalibration({ x: avgX, y: avgY, z: avgZ });
         setMode('tracking');
-        setStartTime(Date.now());
+        setStartTime(Date.now());  // Reset start time when starting tracking
         setMeasurements([]);
         addDebugMessage('Calibration complete! Starting tracking...');
       }
       return newSamples;
     });
-  }, [REQUIRED_CALIBRATION_SAMPLES, addDebugMessage]);
+}, [REQUIRED_CALIBRATION_SAMPLES, addDebugMessage]);
 
   // Add a modeRef to avoid closure issues
   const modeRef = useRef<'idle' | 'connecting' | 'calibrating' | 'tracking'>('idle');
@@ -176,73 +222,63 @@ const MovementTracker: React.FC = () => {
     modeRef.current = mode;
   }, [mode]);
 
-  const handleMotionData = useCallback((event: Event) => {
-    const characteristic = event.target as unknown as BluetoothRemoteGATTCharacteristic;
-    const dataView = characteristic.value;
-    if (!dataView) {
-      addDebugMessage('Received empty dataView');
-      return;
-    }
-    
-    const decoder = new TextDecoder();
-    const rawValue = decoder.decode(dataView);
-    setLastRawData(rawValue);
-    
-    try {
-      const data = JSON.parse(rawValue);
-      setLastParsedData(data);
-      
-      // Debug the current mode and data
-      addDebugMessage(`Mode: ${modeRef.current}, Data: x=${data.x.toFixed(2)}, y=${data.y.toFixed(2)}, z=${data.z.toFixed(2)}`);
-      
-      // Explicitly check the current mode using ref
-      if (modeRef.current === 'calibrating') {
-        const timestamp = Date.now();
-        setCalibrationSamples(prev => {
-          const newSamples = [...prev, { x: data.x, y: data.y, z: data.z, timestamp }];
-          const progress = (newSamples.length / REQUIRED_CALIBRATION_SAMPLES) * 100;
-          
-          // Debug calibration progress
-          addDebugMessage(`Calibration progress: ${newSamples.length}/${REQUIRED_CALIBRATION_SAMPLES}`);
-          setCalibrationProgress(Math.min(progress, 100));
-          
-          if (newSamples.length >= REQUIRED_CALIBRATION_SAMPLES) {
-            const avgX = newSamples.reduce((sum, sample) => sum + sample.x, 0) / newSamples.length;
-            const avgY = newSamples.reduce((sum, sample) => sum + sample.y, 0) / newSamples.length;
-            const avgZ = newSamples.reduce((sum, sample) => sum + sample.z, 0) / newSamples.length;
-            
-            addDebugMessage('Calibration complete, setting averages');
-            setCalibration({ x: avgX, y: avgY, z: avgZ });
-            setMode('tracking');
-            setStartTime(Date.now());
-            setMeasurements([]);
-            return [];
-          }
-          return newSamples;
-        });
-      } else if (modeRef.current === 'tracking') {
-        const calibratedX = data.x - calibration.x;
-        const calibratedY = data.y - calibration.y;
-        const calibratedZ = data.z - calibration.z;
-        
-        setCurrentX(calibratedX);
-        setCurrentY(calibratedY);
-        setCurrentZ(calibratedZ);
+  const measurementCountRef = useRef<number>(0);
 
-        const timestamp = Date.now() - startTime;
-        setMeasurements(prev => [...prev, {
-          x: calibratedX,
-          y: calibratedY,
-          z: calibratedZ,
-          timestamp
-        }]);
+  const handleMotionData = useCallback((event: { target: any; }) => {
+      const characteristic = event.target;
+      const dataView = characteristic.value;
+      if (!dataView) {
+        addDebugMessage('Received empty dataView');
+        return;
       }
-    } catch (error) {
-      const errorMessage = `Error parsing data: ${error instanceof Error ? error.message : String(error)}`;
-      addDebugMessage(errorMessage);
-      setError(errorMessage);
-    }
-  }, [calibration, startTime, REQUIRED_CALIBRATION_SAMPLES, addDebugMessage]);
+      
+      const decoder = new TextDecoder();
+      const rawValue = decoder.decode(dataView);
+      setLastRawData(rawValue);
+      
+      try {
+        const data = JSON.parse(rawValue);
+        setLastParsedData(data);
+        
+        if (modeRef.current === 'calibrating') {
+          handleCalibrationData(data);
+        } else if (modeRef.current === 'tracking') {
+          const calibratedX = data.x - calibration.x;
+          const calibratedY = data.y - calibration.y;
+          const calibratedZ = data.z - calibration.z;
+          
+          setCurrentX(calibratedX);
+          setCurrentY(calibratedY);
+          setCurrentZ(calibratedZ);
+
+          // Calculate time based on measurement count and known sample rate (20Hz = 0.05s per sample)
+          const SAMPLE_PERIOD = 0.05;  // 50ms = 0.05s
+          const elapsedTimeSeconds = measurementCountRef.current * SAMPLE_PERIOD;
+          measurementCountRef.current++;
+          
+          setMeasurements(prev => [...prev, {
+            x: calibratedX,
+            y: calibratedY,
+            z: calibratedZ,
+            timestamp: elapsedTimeSeconds
+          }]);
+
+          // Combined debug message with elapsed time
+          addDebugMessage(
+            `Data [${elapsedTimeSeconds.toFixed(1)}s]: x=${calibratedX.toFixed(2)}°, y=${calibratedY.toFixed(2)}°, z=${calibratedZ.toFixed(2)}°`
+          );
+        }
+      } catch (error) {
+        const errorMessage = `Error parsing data: ${error instanceof Error ? error.message : String(error)}`;
+        addDebugMessage(errorMessage);
+        setError(errorMessage);
+      }
+  }, [calibration, addDebugMessage, handleCalibrationData]);
+
+  // Reset measurement count when starting tracking
+  const resetMeasurementCount = useCallback(() => {
+    measurementCountRef.current = 0;
+  }, []);
 
   const connectBLE = useCallback(async () => {
     try {
@@ -250,41 +286,44 @@ const MovementTracker: React.FC = () => {
       setError(null);
       setCalibrationSamples([]); // Clear any existing samples
       setCalibrationProgress(0);
+      resetMeasurementCount();
       addDebugMessage('Starting BLE connection...');
-
+  
       const device = await navigator.bluetooth.requestDevice({
         filters: [{ name: 'M5Motion' }],
         optionalServices: [SERVICE_UUID]
       });
-
+  
       addDebugMessage('Device selected, connecting to GATT server...');
       const server = await device.gatt?.connect();
       if (!server) throw new Error('Failed to connect to GATT server');
-
+  
       addDebugMessage('Connected to GATT server, getting service...');
       const service = await server.getPrimaryService(SERVICE_UUID);
       const characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
       characteristicRef.current = characteristic;
-
+  
       addDebugMessage('Starting notifications...');
       await characteristic.startNotifications();
       characteristic.addEventListener('characteristicvaluechanged', handleMotionData);
-
+  
       setDevice(device);
       device.addEventListener('gattserverdisconnected', handleDisconnect);
       
-      // Set mode to calibrating after everything is set up
+      // Set start time and mode AFTER everything is set up
+      const nowTime = Date.now();
+      setStartTime(nowTime);
+      addDebugMessage(`Starting calibration at: ${new Date(nowTime).toISOString()}`);
       setMode('calibrating');
-      addDebugMessage('Starting calibration phase');
       playBeep(440);
-
+  
     } catch (error) {
       const errorMessage = `Connection failed: ${error instanceof Error ? error.message : String(error)}`;
       setError(errorMessage);
       addDebugMessage(errorMessage);
       setMode('idle');
     }
-  }, [SERVICE_UUID, CHARACTERISTIC_UUID, handleMotionData, handleDisconnect, addDebugMessage, playBeep]);
+  }, [SERVICE_UUID, CHARACTERISTIC_UUID, handleMotionData, handleDisconnect, addDebugMessage, playBeep, resetMeasurementCount]);
 
   const stopTracking = useCallback(async () => {
     addDebugMessage('Stopping tracking...');
@@ -294,11 +333,15 @@ const MovementTracker: React.FC = () => {
     
     if (measurements.length > 0) {
       calculateFinalStats();
+      const phases = detectSquatPhases(measurements);
+      if (phases) {
+        setSquatPhases(phases);
+      }
     }
     
     setMode('idle');
     playBeep(880);
-  }, [device, measurements.length, calculateFinalStats, addDebugMessage, playBeep]);
+  }, [device, measurements, calculateFinalStats, detectSquatPhases, addDebugMessage, playBeep]);
 
   const DebugPanel = () => (
     <div className="mt-4 p-4 bg-slate-800 rounded-lg border border-slate-700">
@@ -345,20 +388,27 @@ const MovementTracker: React.FC = () => {
     </div>
   );
 
-  const DeviationChart = ({ data, dataKey, title, color }: { 
-    data: Measurement[], 
-    dataKey: 'x' | 'z', 
+  const DeviationChart = ({
+    data,
+    dataKey,
+    title,
+    color,
+    showSquatPhases = false
+  }: {
+    data: Measurement[],
+    dataKey: 'x' | 'z',
     title: string,
-    color: string 
+    color: string,
+    showSquatPhases?: boolean
   }) => {
-    const duration = data.length > 0 ? (data[data.length - 1].timestamp / 1000).toFixed(1) : "0.0";
+    const duration = data.length > 0 ? data[data.length - 1].timestamp.toFixed(1) : "0.0";
     
     return (
       <div className="w-full bg-slate-800 p-4 rounded-lg">
         <h4 className="text-white font-bold mb-2">{title}</h4>
-        <div className="aspect-[16/9] w-full">
+        <div className="aspect-[16/13] w-full">
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={data} margin={{ top: 10, right: 10, bottom: 10, left: 10 }}>
+            <LineChart data={data} margin={{ top: 40, right: 10, bottom: 10, left: 0 }}>
               <ReferenceArea
                 y1={-PERFECT_ZONE_RANGE}
                 y2={PERFECT_ZONE_RANGE}
@@ -375,18 +425,32 @@ const MovementTracker: React.FC = () => {
                 strokeWidth={2}
               />
               <CartesianGrid strokeDasharray="3 3" stroke="#475569" />
+              {showSquatPhases && squatPhases?.bottomPoint && (
+                <ReferenceLine
+                  x={squatPhases.bottomPoint}
+                  stroke="#ef4444"
+                  strokeWidth={2}
+                  label={{
+                    value: "Bottom",
+                    position: "top",
+                    fill: "#ef4444",
+                    offset: 20
+                  }}
+                />
+              )}
               <XAxis
                 dataKey="timestamp"
-                tickFormatter={(value) => `${(value / 1000).toFixed(1)}s`}
+                tickFormatter={(value) => `${Number(value).toFixed(1)}s`}
                 stroke="#94a3b8"
+                domain={[0, 'dataMax']}
                 tick={({ x, y, payload }) => {
-                  const seconds = payload.value / 1000;
+                  const seconds = Number(payload.value);
                   const isFullSecond = Math.abs(seconds - Math.round(seconds)) < 0.05;
                   return (
-                    <text 
-                      x={x} 
-                      y={y + 10} 
-                      textAnchor="middle" 
+                    <text
+                      x={x}
+                      y={y + 10}
+                      textAnchor="middle"
                       fill="#94a3b8"
                       className={isFullSecond ? "font-bold" : ""}
                     >
@@ -395,19 +459,20 @@ const MovementTracker: React.FC = () => {
                   );
                 }}
               />
-              <YAxis 
-                domain={[-10, 10]} 
+              <YAxis
+                domain={[-10, 10]}
                 stroke="#94a3b8"
                 tickFormatter={(value) => `${value}°`}
+                dx={-30}
               />
               <Tooltip
                 contentStyle={{ backgroundColor: '#1e293b', border: 'none' }}
                 labelStyle={{ color: '#94a3b8' }}
                 formatter={(value: number) => [
-                  `${value.toFixed(2)}°${Math.abs(value) <= PERFECT_ZONE_RANGE ? ' ✓' : ''}`, 
+                  `${value.toFixed(2)}°${Math.abs(value) <= PERFECT_ZONE_RANGE ? ' ✓' : ''}`,
                   'Deviation'
                 ]}
-                labelFormatter={(label) => `Time: ${(Number(label) / 1000).toFixed(1)}s`}
+                labelFormatter={(label) => `Time: ${Number(label).toFixed(1)}s`}
               />
               <Line
                 type="monotone"
@@ -512,39 +577,58 @@ const MovementTracker: React.FC = () => {
         </div>
       )}
 
-      {mode === 'idle' && finalStats && (
-        <div className="space-y-4 mt-6">
-          <h3 className="text-white font-bold text-xl mb-4">FINAL RESULTS:</h3>
-          
+    {mode === 'idle' && finalStats && (
+      <div className="space-y-4 mt-6">
+        <h3 className="text-white font-bold text-xl mb-4">FINAL RESULTS:</h3>
+        
+        {squatPhases?.bottomPoint && (
           <div className="p-4 bg-slate-800 rounded-lg border border-slate-700">
-            <strong className="text-emerald-400">Max Deviation:</strong>
-            <span className="text-white ml-2">{finalStats.maxDeviation}°</span>
+            <div className="mb-2">
+              <strong className="text-red-400">Bottom of Squat:</strong>
+              <span className="text-white ml-2">
+                {squatPhases.bottomPoint.toFixed(1)}s  {/* Removed the /1000 since timestamp is now in seconds */}
+              </span>
+            </div>
+            <div>
+              <strong className="text-red-400">Max Depth:</strong>
+              <span className="text-white ml-2">
+                {Math.abs(squatPhases.maxDepth).toFixed(1)}°
+              </span>
+            </div>
           </div>
-          <div className="p-4 bg-slate-800 rounded-lg border border-slate-700">
-            <strong className="text-emerald-400">Avg Deviation:</strong>
-            <span className="text-white ml-2">{finalStats.avgDeviation}°</span>
-          </div>
-          <div className="p-4 bg-slate-800 rounded-lg border border-slate-700">
-            <strong className="text-emerald-400">Samples:</strong>
-            <span className="text-white ml-2">{finalStats.samples}</span>
-          </div>
+        )}
 
-          <div className="space-y-4 mt-6">
-            <DeviationChart 
-              data={measurements} 
-              dataKey="x" 
-              title="Final Side-to-side Deviation" 
-              color="#22c55e"
-            />
-            <DeviationChart 
-              data={measurements} 
-              dataKey="z" 
-              title="Final Forward-back Deviation" 
-              color="#3b82f6"
-            />
-          </div>
+        <div className="p-4 bg-slate-800 rounded-lg border border-slate-700">
+          <strong className="text-emerald-400">Max Deviation:</strong>
+          <span className="text-white ml-2">{finalStats.maxDeviation}°</span>
         </div>
-      )}
+        <div className="p-4 bg-slate-800 rounded-lg border border-slate-700">
+          <strong className="text-emerald-400">Avg Deviation:</strong>
+          <span className="text-white ml-2">{finalStats.avgDeviation}°</span>
+        </div>
+        <div className="p-4 bg-slate-800 rounded-lg border border-slate-700">
+          <strong className="text-emerald-400">Samples:</strong>
+          <span className="text-white ml-2">{finalStats.samples}</span>
+        </div>
+
+        <div className="space-y-4 mt-6">
+          <DeviationChart 
+            data={measurements} 
+            dataKey="z" 
+            title="Squat Depth (Forward-back Movement)" 
+            color="#3b82f6"
+            showSquatPhases={true}
+          />
+          <DeviationChart 
+            data={measurements} 
+            dataKey="x" 
+            title="Lateral Movement (Side-to-side)" 
+            color="#22c55e"
+            showSquatPhases={true}
+          />
+        </div>
+      </div>
+    )}
     </div>
   );
 };
